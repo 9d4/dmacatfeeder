@@ -24,6 +24,8 @@
 #define SERVO_OPEN_POS 180
 #define SHAKER_ON 0
 #define SHAKER_OFF 1
+#define SHAKER_DUR 100
+#define SHAKER_GAP 100
 
 #define WIFI_RESET_GPIO 14
 #define WIFI_RESET_TRIG 0
@@ -45,6 +47,8 @@ Card elServoSlider(&dashboard, SLIDER_CARD, "Servo", "", 0, 180, 0);
 Card elCurrentTime(&dashboard, GENERIC_CARD, "Current Time");
 Card elHourSet(&dashboard, SLIDER_CARD, "Hour", "", 0, 23, 0);
 Card elMinuteSet(&dashboard, SLIDER_CARD, "Minute", "", 0, 59, 0);
+Card elOpenDuration(&dashboard, SLIDER_CARD, "Open Duration", "", 1, 60);
+Card elOpenServo(&dashboard, SLIDER_CARD, "Open Servo Degree", "", 0, 180);
 
 int servoPos;
 bool ntpBegan;
@@ -69,7 +73,7 @@ void setup() {
   wm.setConfigPortalTimeout(180);
   wm.setSaveConfigCallback(wmConfigSetCallback);
   wm.setAPCallback(wmAPCallback);
-  wm.setAPStaticIPConfig(IPAddress(192,168,88,1), IPAddress(192,168,88,1), IPAddress(255,255,255,0));
+  wm.setAPStaticIPConfig(IPAddress(192, 168, 88, 1), IPAddress(192, 168, 88, 1), IPAddress(255, 255, 255, 0));
   wm.autoConnect();
 
   ticker.detach();
@@ -87,37 +91,15 @@ void setup() {
 
 void loop() {
   wm.loop();
+  wifiResetLoop();
   ntpLoop();
   WebSerial.loop();
   dashboardLoop();
   ArduinoOTA.handle();
   servoLoop();
-
-  const int wifiResetHold = 5000;
-  const int wifiResetCheck = 1000;
-  static int lastResetCheck = 0;
-  static int lastResetHold = 0;
-  static int lastResetHoldVal = 0;
-
-  int currentResetVal = digitalRead(WIFI_RESET_GPIO);
-
-  if ((millis() - lastResetCheck) >= wifiResetCheck) {
-    if (lastResetHoldVal == WIFI_RESET_NORMAL && currentResetVal == WIFI_RESET_TRIG) {
-      WebSerial.println("Reset pressed");
-      ticker.attach(0.5, tick);
-      lastResetHold = millis();
-    }
-    if (lastResetHoldVal == WIFI_RESET_TRIG && currentResetVal == WIFI_RESET_NORMAL) {
-      WebSerial.println("Reset released");
-      ticker.detach();
-      digitalWrite(BUILTIN_LED, HIGH);
-    }
-    lastResetHoldVal = currentResetVal;
-  }
-
-  if (currentResetVal == WIFI_RESET_TRIG && (millis() - lastResetHold) >= wifiResetHold) {
-    wm.resetSettings();
-    ESP.restart();
+  // no interrupt
+  while (openLoop()) {
+    servoLoop();
   }
 }
 
@@ -148,6 +130,57 @@ void recvMsg(uint8_t* data, size_t len) {
     delay(500);
     ESP.restart();
   }
+}
+
+int openLoop() {
+  static int open = 0;
+  static int lastOpen = 0;
+
+  const int runDelay = 100;
+  static int lastRun = 0;
+  if (!((millis() - lastRun) > runDelay)) {
+    return open;
+  }
+
+  int dur = pref.getInt("opendur") * 1000;
+  static int lastOpenDay = -1;
+  static int lastOpenHours = -1;
+  static int lastOpenMinutes = -1;
+  if (!open && ntp.getHours() == pref.getInt("hour") && ntp.getMinutes() == pref.getInt("minute")) {
+    if (!(lastOpenDay == ntp.getDay() && lastOpenHours == ntp.getHours() && lastOpenMinutes == ntp.getMinutes())) {
+      lastOpenDay = ntp.getDay();
+      lastOpenHours = ntp.getHours();
+      lastOpenMinutes = ntp.getMinutes();
+
+      ticker.attach(0.4, tick);
+      open = 1;
+      servoPos = pref.getInt("opensrv");
+      lastOpen = millis();
+    }
+  }
+  if (open && (millis() - lastOpen >= dur)) {
+    open = 0;
+    ticker.detach();
+
+    shakerSwitch(SHAKER_OFF);
+    digitalWrite(BUILTIN_LED, HIGH); 
+    servoPos = SERVO_INIT_POS;
+    return open;
+  }
+
+  static int lastShake = 0;
+  if (open) {
+    if (millis() > (lastShake + SHAKER_DUR)) {
+      shakerSwitch(SHAKER_OFF);
+    }
+    if (millis() > (lastShake + SHAKER_DUR + SHAKER_GAP)) {
+      shakerSwitch(SHAKER_ON);
+      lastShake = millis();
+    }
+  }
+
+  lastRun = millis();
+  return open;
 }
 
 void tick() {
@@ -185,6 +218,18 @@ void dashboardSetup() {
     elMinuteSet.update(pref.getInt("minute"));
     dashboard.sendUpdates();
   });
+
+  elOpenDuration.attachCallback([&](int value) {
+    pref.putInt("opendur", value);
+    elOpenDuration.update(pref.getInt("opendur"));
+    dashboard.sendUpdates();
+  });
+
+  elOpenServo.attachCallback([&](int value) {
+    pref.putInt("opensrv", value);
+    elOpenServo.update(pref.getInt("opensrv"));
+    dashboard.sendUpdates();
+  });
 }
 
 void dashboardLoop() {
@@ -195,6 +240,8 @@ void dashboardLoop() {
     elCurrentTime.update(ntp.getFormattedTime());
     elHourSet.update(pref.getInt("hour"));
     elMinuteSet.update(pref.getInt("minute"));
+    elOpenDuration.update(pref.getInt("opendur"));
+    elOpenServo.update(pref.getInt("opensrv"));
 
     dashboard.sendUpdates();
     lastRun = millis();
@@ -202,7 +249,8 @@ void dashboardLoop() {
 }
 
 void ntpLoop() {
-  const long delay = 1000;
+  // no need high accuracy
+  const long delay = 60 * 1000;
   static int last = 0;
 
   if ((millis() - last) >= delay) {
@@ -215,14 +263,13 @@ void ntpLoop() {
     }
 
     ntp.update();
-    String formattedTime = ntp.getFormattedTime();
   }
 }
 
 void servoLoop() {
   const long servoDelay = 10;
   static int lastRun = 0;
-  if ((millis() - lastRun) >= servoDelay && servo.read() != servoPos) {
+  if (servo.read() != servoPos && (millis() - lastRun) >= servoDelay) {
     int incr = 1;
     if (servoPos < servo.read()) { incr = -1; }
 
@@ -232,7 +279,6 @@ void servoLoop() {
 
     servo.write(next);
     lastRun = millis();
-    Serial.printf("moving %d; %d\n", servoPos, next);
   }
 }
 
@@ -299,4 +345,33 @@ void setupOTA() {
     }
   });
   ArduinoOTA.begin();
+}
+
+void wifiResetLoop() {
+  const int wifiResetHold = 5000;
+  const int wifiResetCheck = 1000;
+  static int lastResetCheck = 0;
+  static int lastResetHold = 0;
+  static int lastResetHoldVal = 0;
+
+  int currentResetVal = digitalRead(WIFI_RESET_GPIO);
+
+  if ((millis() - lastResetCheck) >= wifiResetCheck) {
+    if (lastResetHoldVal == WIFI_RESET_NORMAL && currentResetVal == WIFI_RESET_TRIG) {
+      WebSerial.println("Reset pressed");
+      ticker.attach(0.5, tick);
+      lastResetHold = millis();
+    }
+    if (lastResetHoldVal == WIFI_RESET_TRIG && currentResetVal == WIFI_RESET_NORMAL) {
+      WebSerial.println("Reset released");
+      ticker.detach();
+      digitalWrite(BUILTIN_LED, HIGH);
+    }
+    lastResetHoldVal = currentResetVal;
+  }
+
+  if (currentResetVal == WIFI_RESET_TRIG && (millis() - lastResetHold) >= wifiResetHold) {
+    wm.resetSettings();
+    ESP.restart();
+  }
 }
